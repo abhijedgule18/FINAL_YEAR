@@ -1,27 +1,42 @@
-# main.py
+import streamlit as st
 import pandas as pd
 import random
 import re
-from googletrans import Translator
+import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
-import nltk
-from transformers import XLMRobertaTokenizer, XLMRobertaForSequenceClassification
-from src.data_cleaning import load_data, clean_data
-from src.text_processing import process_text
-from src.visualization import visualize_data
 
-import torch
-from sklearn.model_selection import train_test_split
-import torch.nn.functional as F
+# Import your project modules
+# Conditional imports to avoid the torch error in Streamlit's file watcher
+if 'torch' not in st.session_state:
+    import torch
+    import torch.nn.functional as F
+    from transformers import XLMRobertaTokenizer, XLMRobertaForSequenceClassification
+    from googletrans import Translator
+
+    st.session_state['torch'] = True
+
+# Import your project modules - use try/except to handle possible import errors
+try:
+    from src.data_cleaning import load_data, clean_data
+    from src.text_processing import process_text
+    from src.visualization import visualize_data, visualize_model_results
+    from src import model_training
+except ImportError:
+    st.error(
+        "Could not import required modules from 'src'. Make sure the application is run from the correct directory.")
+    st.stop()
+
 
 # Download required NLTK data
-nltk.download('punkt', quiet=True)
-nltk.download('stopwords', quiet=True)
+@st.cache_resource
+def download_nltk_data():
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
 
-# Define disaster-related keywords
-DISASTER_KEYWORDS = [
-    "earthquake", "flood", "hurricane", "typhoon", "fire", "landslide",
+
+# Define disaster keywords
+DISASTER_KEYWORDS = [ "earthquake", "flood", "hurricane", "typhoon", "fire", "landslide",
     "tsunami", "storm", "cyclone", "explosion", "injured", "disaster",
     "emergency", "evacuation", "volcanic eruption", "tornado", "wildfire",
     "drought", "heat wave", "severe thunderstorm", "blizzard", "hailstorm",
@@ -119,91 +134,363 @@ DISASTER_KEYWORDS = [
     "democratic governance", "rule of law", "human rights advocacy",
     "peace and justice", "social change", "global citizenship",
     "sustainable living", "environmental stewardship", "planetary health",
-    "human security", "well-being for all"
-]
+    "human security", "well-being for all]
+
 
 class DisasterAnalyzer:
     def __init__(self):
+        self.tokenizer = None
+        self.model = None
+        self.translator = None
+        self.device = None
+
+    def initialize_models(self):
+        progress_text = st.empty()
+        progress_text.text("Loading models...")
+
+        # Import torch modules here instead of at the top level
+        import torch
+        import torch.nn.functional as F
+        from transformers import XLMRobertaTokenizer, XLMRobertaForSequenceClassification
+        from googletrans import Translator
+
         self.tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
         self.model = XLMRobertaForSequenceClassification.from_pretrained('xlm-roberta-base', num_labels=2)
         self.translator = Translator()
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         self.model.to(self.device)
+        progress_text.text("Models loaded successfully!")
 
     def preprocess_text(self, text):
-        """Clean and preprocess the tweet text using text_processing.py"""
-        text = re.sub(r"http\S+", "", text)  # Remove URLs
-        text = re.sub(r"@\w+", "", text)  # Remove mentions
-        text = re.sub(r"[^\w\s]", "", text)  # Remove punctuation
+        text = re.sub(r"http\S+", "", str(text))
+        text = re.sub(r"@\w+", "", text)
+        text = re.sub(r"[^\w\s]", "", text)
         return text.lower()
 
     def extract_keywords(self, tweet):
-        """Extract keywords from a tweet"""
         tokens = word_tokenize(self.preprocess_text(tweet))
         stop_words = set(stopwords.words("english"))
         return [word for word in tokens if word not in stop_words and word.isalpha()]
 
     def translate_keywords(self, keywords):
-        """Translate keywords into English using Google Translate"""
         translated = []
         for keyword in keywords:
             try:
                 translated.append(self.translator.translate(keyword, dest='en').text)
             except Exception as e:
-                print(f"Translation error: {e}")
+
                 translated.append(keyword)
         return translated
 
     def classify_with_xlm_roberta(self, tweet):
-        """Classify tweet using XLM-RoBERTa model"""
+        # Import torch modules here
+        import torch
+        import torch.nn.functional as F
+
         self.model.eval()
         inputs = self.tokenizer(tweet, return_tensors="pt", padding=True, truncation=True).to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
         probabilities = F.softmax(outputs.logits, dim=1)
         predicted_class = torch.argmax(probabilities, dim=1).item()
-        return predicted_class
+        confidence = probabilities[0][predicted_class].item()
+        return predicted_class, confidence
 
     def classify_by_keywords(self, translated_keywords):
-        """Keyword-based classification"""
-        return 1 if any(kw in DISASTER_KEYWORDS for kw in translated_keywords) else 0
+        matches = [kw for kw in translated_keywords if kw in DISASTER_KEYWORDS]
+        return 1 if matches else 0, matches
 
-    def prepare_data(self, file_path):
-        """Load, clean, and prepare data for processing."""
-        raw_data = load_data(file_path)
-        cleaned_data = clean_data(raw_data)
+    def prepare_data(self, data_frame):
+        progress_text = st.empty()
+        progress_text.text("Cleaning data...")
+
+        # If data_frame came from a file upload, it's already a dataframe
+        # Otherwise, assume it came from load_data
+        if isinstance(data_frame, pd.DataFrame):
+            cleaned_data = clean_data(data_frame)
+        else:
+            # Handle the case where data_frame might be a path
+            raw_data = load_data(data_frame) if isinstance(data_frame, str) else data_frame
+            cleaned_data = clean_data(raw_data)
+
+        progress_text.text("Processing text...")
         processed_data = process_text(cleaned_data)
+        progress_text.empty()
         return processed_data
 
-    def analyze_dataset(self, file_path):
-        """Full analysis pipeline using integrated modules"""
+    def analyze_dataset(self, data_frame):
+        # Initialize models if not already done
+        if self.model is None:
+            self.initialize_models()
+
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+
         # Prepare data
-        processed_data = self.prepare_data(file_path)
+        progress_text.text("Preparing data...")
+        progress_bar.progress(10)
+        processed_data = self.prepare_data(data_frame)
 
-        # Visualization
-        visualize_data(processed_data)
+        # Create results container
+        results_container = st.container()
 
-        # Sample analysis
-        random_idx = random.randint(0, len(processed_data) - 1)
-        sample_tweet = processed_data.iloc[random_idx]['Tweet Text']
+        with results_container:
+            st.subheader("Analysis Results")
 
-        print("\nRandom Tweet Analysis:")
-        print(f"Original Tweet: {sample_tweet}")
-        print(f"Cleaned Text: {self.preprocess_text(sample_tweet)}")
+            # Display data summary
+            progress_text.text("Analyzing dataset...")
+            progress_bar.progress(30)
 
-        # Classify with XLM-RoBERTa model
-        xlm_class_idx = self.classify_with_xlm_roberta(sample_tweet)
-        classification_semantic = "Disaster" if xlm_class_idx == 1 else "Non-Disaster"
+            # Calculate dataset statistics
+            total_tweets = len(processed_data)
 
-        # Classify by keywords
-        keywords = self.translate_keywords(self.extract_keywords(sample_tweet))
-        classification_keyword = "Disaster" if self.classify_by_keywords(keywords) == 1 else "Non-Disaster"
+            # Check if 'is_disaster' column exists for classification stats
+            disaster_stats = {}
+            if 'is_disaster' in processed_data.columns:
+                processed_data['is_disaster'] = processed_data['is_disaster'].astype(int)
+                disaster_count = processed_data['is_disaster'].sum()
+                non_disaster_count = total_tweets - disaster_count
+                disaster_percent = (disaster_count / total_tweets) * 100 if total_tweets > 0 else 0
 
-        print(f"Translated Keywords: {keywords}")
-        print(f"Classification (Semantic): {classification_semantic}")
-        print(f"Classification (Keyword): {classification_keyword}")
+                disaster_stats = {
+                    "Total Tweets": total_tweets,
+                    "Disaster Tweets": disaster_count,
+                    "Non-Disaster Tweets": non_disaster_count,
+                    "Disaster Percentage": f"{disaster_percent:.1f}%"
+                }
+            else:
+                disaster_stats = {
+                    "Total Tweets": total_tweets,
+                    "Classification": "No pre-labeled data available"
+                }
+
+            # Display dataset statistics in a table
+            st.subheader("Dataset Summary")
+            stats_df = pd.DataFrame([disaster_stats])
+            st.table(stats_df.T.rename(columns={0: "Value"}))
+
+            # Analyze random tweets
+            st.subheader("Random Tweet Analysis")
+            progress_bar.progress(50)
+
+            if total_tweets > 0:
+                # Select multiple random tweets
+                num_samples = min(3, total_tweets)  # Analyze up to 3 random tweets
+                random_indices = random.sample(range(total_tweets), num_samples)
+
+                # Create lists to store results
+                original_tweets = []
+                cleaned_texts = []
+                keywords_list = []
+                semantic_classifications = []
+                semantic_confidences = []
+                keyword_classifications = []
+                keyword_matches = []
+
+                # Analyze each tweet
+                for idx in random_indices:
+                    sample_tweet = processed_data.iloc[idx]['Tweet Text']
+                    cleaned_text = self.preprocess_text(sample_tweet)
+                    keywords = self.extract_keywords(sample_tweet)
+                    translated_kw = self.translate_keywords(keywords)
+
+                    xlm_class_idx, confidence = self.classify_with_xlm_roberta(sample_tweet)
+                    classification_semantic = "Disaster" if xlm_class_idx == 1 else "Non-Disaster"
+
+                    keyword_class, matching_keywords = self.classify_by_keywords(translated_kw)
+                    classification_keyword = "Disaster" if keyword_class == 1 else "Non-Disaster"
+
+                    # Append results to lists
+                    original_tweets.append(sample_tweet)
+                    cleaned_texts.append(cleaned_text)
+                    keywords_list.append(", ".join(translated_kw))
+                    semantic_classifications.append(classification_semantic)
+                    semantic_confidences.append(f"{confidence:.2%}")
+                    keyword_classifications.append(classification_keyword)
+                    keyword_matches.append(", ".join(matching_keywords) if matching_keywords else "None")
+
+                # Create results DataFrame
+                tweet_results = pd.DataFrame({
+                    "Original Tweet": original_tweets,
+                    "Cleaned Text": cleaned_texts,
+                    "Keywords": keywords_list,
+                    "Semantic Classification": semantic_classifications,
+                    "Confidence": semantic_confidences,
+                    "Keyword Classification": keyword_classifications,
+                    "Matching Disaster Keywords": keyword_matches
+                })
+
+                # Display results in a table
+                st.table(tweet_results)
+            else:
+                st.error("No data available for analysis. Please check your dataset.")
+
+        # Train and evaluate models
+        st.subheader("Model Training & Evaluation")
+        progress_text.text("Training models...")
+        progress_bar.progress(80)
+
+        try:
+            model_results = model_training.train_model(processed_data)
+
+            # Process model results for display
+            if isinstance(model_results, tuple) and len(model_results) == 5:
+                xgb_model, lgb_model, vectorizer, label_encoder, results = model_results
+            else:
+                results = model_results
+
+            # Format results for display in a table
+            model_performance = self.format_model_results(results)
+
+            # Display model performance table
+            st.subheader("Model Performance")
+            st.table(model_performance)
+
+            progress_text.text("Analysis completed!")
+            progress_bar.progress(100)
+        except Exception as e:
+            st.error(f"Error during model training: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc(), language="python")
+            progress_bar.progress(100)
+
+    def format_model_results(self, results):
+        # Handle different formats of results and convert to a DataFrame for display
+        try:
+            # Case 1: results is a dictionary with model names as keys
+            if isinstance(results, dict) and hasattr(results, 'keys'):
+                model_names = list(results.keys())
+                metrics = pd.DataFrame()
+
+                for metric in ['accuracy', 'precision', 'recall', 'f1']:
+                    if all(metric in results[model] for model in model_names):
+                        metrics[metric.capitalize()] = [results[model][metric] for model in model_names]
+
+                metrics.index = model_names
+                return metrics
+
+            # Case 2: results is a list of dictionaries with 'model' and metrics
+            elif isinstance(results, list) and all(isinstance(item, dict) for item in results):
+                df = pd.DataFrame(results)
+
+                if 'model' in df.columns:
+                    df = df.set_index('model')
+                    print(df)
+                return df
+
+            # Case 3: results is a list of accuracies
+            elif isinstance(results, list) and all(isinstance(item, (int, float)) for item in results):
+                return pd.DataFrame({
+                    'Accuracy': results,
+                    'Model': [f"Model {i + 1}" for i in range(len(results))]
+                }).set_index('Model')
+
+            # Case 4: results might be a single model with metrics as attributes
+            elif hasattr(results, 'accuracy'):
+                metrics = {}
+                for metric in ['accuracy', 'precision', 'recall', 'f1']:
+                    if hasattr(results, metric):
+                        metrics[metric.capitalize()] = getattr(results, metric)
+                return pd.DataFrame([metrics], index=['Model'])
+
+            else:
+                # Default case if structure is unknown
+                return pd.DataFrame([{'Result': f"Unknown format: {type(results)}"}])
+
+        except Exception as e:
+            return pd.DataFrame([{'Error': f"Could not format results: {str(e)}"}])
+
+
+def main():
+    st.title("Disaster Tweet Analyzer")
+    st.write("""
+    Upload a CSV file containing tweets to analyze whether they are related to disasters.
+    The app will clean the data, process the text, and classify tweets using both semantic and keyword-based approaches.
+    """)
+
+    # Download NLTK data at startup
+    download_nltk_data()
+
+    analyzer = DisasterAnalyzer()
+
+    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+
+    if uploaded_file is not None:
+        st.success("File uploaded successfully!")
+
+        try:
+            # Preview the data
+            df = pd.read_csv(uploaded_file)
+            st.subheader("Data Preview")
+            st.dataframe(df.head())
+
+            # Check if required columns are present or can be created
+            if 'Tweet Text' not in df.columns:
+                # Try to find a suitable text column
+                text_columns = [col for col in df.columns if 'text' in col.lower() or 'tweet' in col.lower()]
+
+                if text_columns:
+                    # Use the first matching column
+                    df['Tweet Text'] = df[text_columns[0]]
+                    st.info(f"Using '{text_columns[0]}' as the 'Tweet Text' column.")
+                else:
+                    st.warning(
+                        "The uploaded file does not have a 'Tweet Text' column. Please ensure your data has the correct format.")
+                    st.stop()
+
+            # Add start analysis button
+            if st.button("Start Analysis"):
+                with st.spinner("Analyzing data..."):
+                    analyzer.analyze_dataset(df)
+
+        except Exception as e:
+            st.error(f"Error processing file: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc(), language="python")
+
+    st.sidebar.title("About")
+    st.sidebar.info("""
+    This application analyzes tweets to determine if they are related to disasters.
+    It uses both semantic analysis with XLM-RoBERTa and keyword-based analysis.
+    """)
+
+    # Add option to analyze a single tweet
+    st.sidebar.subheader("Quick Tweet Analysis")
+    sample_tweet = st.sidebar.text_area("Enter a tweet to analyze:")
+
+    if sample_tweet and st.sidebar.button("Analyze Tweet"):
+        # Initialize models if not already done
+        if analyzer.model is None:
+            analyzer.initialize_models()
+
+        with st.sidebar:
+            with st.spinner("Analyzing tweet..."):
+                cleaned_text = analyzer.preprocess_text(sample_tweet)
+                keywords = analyzer.extract_keywords(sample_tweet)
+                translated_kw = analyzer.translate_keywords(keywords)
+
+                xlm_class_idx, confidence = analyzer.classify_with_xlm_roberta(sample_tweet)
+                classification = "Disaster" if xlm_class_idx == 1 else "Non-Disaster"
+
+                keyword_class, matches = analyzer.classify_by_keywords(translated_kw)
+                kw_classification = "Disaster" if keyword_class == 1 else "Non-Disaster"
+
+                # Display results in a more tabular format
+                results_df = pd.DataFrame({
+                    "Analysis": ["Cleaned Text", "Keywords", "Semantic Classification", "Confidence",
+                                 "Keyword Classification", "Matching Keywords"],
+                    "Result": [
+                        cleaned_text,
+                        ", ".join(translated_kw),
+                        classification,
+                        f"{confidence:.2%}",
+                        kw_classification,
+                        ", ".join(matches) if matches else "None"
+                    ]
+                }).set_index("Analysis")
+
+                st.table(results_df)
+
 
 if __name__ == "__main__":
-    analyzer = DisasterAnalyzer()
-    file_path = r"C:\Users\abhis\Desktop\DisasterAnalysis\final_project2025\data\CLEANED_NEW_FINALDATASET_modifiednew.csv"
-    analyzer.analyze_dataset(file_path)
+    main()
